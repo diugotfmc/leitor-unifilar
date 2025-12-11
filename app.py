@@ -28,7 +28,8 @@ with st.expander("⚙️ Opções avançadas"):
     header_required = st.number_input("Mínimo de títulos do cabeçalho a encontrar (>=)", 3, 10, 6)
     mostrar_pre = st.checkbox("Mostrar linhas reconstruídas / debug", value=False)
     mostrar_colunas = st.checkbox("Mostrar limites de colunas (x_left/x_right) – debug", value=False)
-    forcar_quatro_numeros = st.checkbox("Forçar 4 primeiros valores numéricos em CBS/PCS/Qtd p/ PCS/Item", value=True)
+    # Agora força números ou traços nas 4 primeiras colunas
+    forcar_quatro_campos = st.checkbox("Forçar 4 primeiros campos (número ou traço) em CBS/PCS/Qtd p/ PCS/Item", value=True)
 
 # =========================
 # Colunas canônicas + aliases
@@ -218,40 +219,57 @@ def assign_words_to_columns(words, columns):
     return {name: " ".join(tokens).strip() for name, tokens in by_col.items()}
 
 # =========================
-# Regra para 4 primeiros numéricos
+# Regra para 4 primeiros "primitivos" (número ou traço)
 # =========================
-NUM_RE = re.compile(r'^[+-]?\d+(?:[.,]\d+)?$')
+# Aceitar inteiros/decimais com ponto/vírgula (ex.: 104.1, 1,0000, 200) e traços -, –, —
+NUM_RE   = re.compile(r'^[+-]?\d+(?:[.,]\d+)?$')
+DASH_RE  = re.compile(r'^[-–—]$')
+PRIMITIVE_RE = re.compile(r'^(?:[+-]?\d+(?:[.,]\d+)?|[-–—])$')
 
-def fill_first_four_numeric(row: dict, line_words: list) -> dict:
+def normalize_dash(s: str) -> str:
+    # unifica traços tipográficos para '-'
+    s = s.replace('–', '-').replace('—', '-')
+    return s
+
+def is_primitive_val(val: str) -> bool:
+    v = normalize_dash(str(val).strip())
+    return bool(PRIMITIVE_RE.match(v))
+
+def fill_first_four_primitives(row: dict, line_words: list) -> dict:
     """
-    Força os quatro primeiros valores numéricos da linha a preencher:
+    Força os quatro primeiros 'primitivos' da linha (número ou traço) a preencher:
     CBS, PCS, Quantidade para PCS, Item (nessa ordem).
-    Só aplica se uma dessas colunas estiver vazia ou não numérica.
     Mantém tudo como texto.
+    Ex.: '- - - 33' -> CBS='-', PCS='-', Quantidade para PCS='-', Item='33'
     """
     first_four_cols = ["CBS", "PCS", "Quantidade para PCS", "Item"]
 
-    # Precisa aplicar? (algum dos quatro está vazio ou não numérico)
+    # Aplicar se algum dos quatro estiver vazio ou não for 'primitivo'
     need_fix = False
     for c in first_four_cols:
         val = str(row.get(c, "")).strip()
-        if not val or not NUM_RE.match(val):
+        if not val or not is_primitive_val(val):
             need_fix = True
             break
 
-    if not need_fix:
-        return row
+    # Coletar tokens (esquerda→direita) que sejam 'primitivos'
+    if need_fix:
+        ordered = sorted(line_words, key=lambda w: w["x0"])
+        prims = []
+        for w in ordered:
+            t = normalize_dash(w["text"].strip())
+            if PRIMITIVE_RE.match(t):
+                prims.append(t)
+            # pare cedo se já coletou 4
+            if len(prims) >= 4:
+                break
 
-    # Coletar tokens numéricos da linha (ordenados por x0)
-    ordered = sorted(line_words, key=lambda w: w["x0"])
-    nums = [w["text"].strip() for w in ordered if NUM_RE.match(w["text"].strip())]
-
-    # Se encontramos ao menos 4 números, aplicar mapeamento estrito
-    if len(nums) >= 4:
-        row["CBS"] = nums[0]
-        row["PCS"] = nums[1]
-        row["Quantidade para PCS"] = nums[2]
-        row["Item"] = nums[3]
+        # Se encontramos ao menos 4, preencher na ordem
+        if len(prims) >= 4:
+            row["CBS"] = prims[0]
+            row["PCS"] = prims[1]
+            row["Quantidade para PCS"] = prims[2]
+            row["Item"] = prims[3]
 
     return row
 
@@ -313,9 +331,9 @@ with pdfplumber.open(dw_file) as pdf:
             for c in CANONICAL_TITLES:
                 row.setdefault(c, "")
 
-            # >>> Patch para garantir CBS/PCS/Quantidade para PCS/Item
-            if forcar_quatro_numeros:
-                row = fill_first_four_numeric(row, ln["words"])
+            # >>> Patch para garantir CBS/PCS/Quantidade para PCS/Item com números ou traços
+            if forcar_quatro_campos:
+                row = fill_first_four_primitives(row, ln["words"])
 
             # ignorar linha totalmente vazia (em colunas canônicas)
             if not any(str(row.get(c, "")).strip() for c in CANONICAL_TITLES):
