@@ -23,11 +23,12 @@ dw_file = st.file_uploader("Envie o PDF do unifilar/desenho", type=["pdf"])
 # =========================
 with st.expander("⚙️ Opções avançadas"):
     y_tol   = st.slider("Tolerância vertical para agrupar palavras (px)", 1, 12, 5)
-    x_tol   = st.slider("Tolerância horizontal para ordenar palavras (px)", 1, 12, 4)
+    x_tol   = st.slider("Tolerância horizontal para ordenar palavras (px)", 1, 12, 5)
     win_h   = st.slider("Altura da janela acima do cabeçalho (px)", 100, 900, 500)
     header_required = st.number_input("Mínimo de títulos do cabeçalho a encontrar (>=)", 3, 10, 6)
     mostrar_pre = st.checkbox("Mostrar linhas reconstruídas / debug", value=False)
     mostrar_colunas = st.checkbox("Mostrar limites de colunas (x_left/x_right) – debug", value=False)
+    forcar_quatro_numeros = st.checkbox("Forçar 4 primeiros valores numéricos em CBS/PCS/Qtd p/ PCS/Item", value=True)
 
 # =========================
 # Colunas canônicas + aliases
@@ -49,8 +50,8 @@ CANONICAL_TITLES = [
 COLUMN_ALIASES = {
     "CBS": ["cbs"],
     "PCS": ["pcs"],
-    "Quantidade para PCS": ["quantidade para pcs", "qtd para pcs"],
-    "Item": ["item", "pos.", "posicao", "posição"],  # se quiser relaxar para POS/Posição
+    "Quantidade para PCS": ["quantidade para pcs", "qtd para pcs", "qtd p/ pcs"],
+    "Item": ["item", "pos.", "posicao", "posição"],
     "Qtd mont na linha": ["qtd mont na linha", "qtd. mont na linha", "qtd mont. na linha"],
     "Qtd mont a bordo": ["qtd mont a bordo", "qtd. mont a bordo", "qtd mont. a bordo"],
     "Qtd avulsa": ["qtd avulsa", "qtd. avulsa", "quantidade avulsa"],
@@ -71,6 +72,9 @@ def normalize_text(s: str) -> str:
 ALIAS_TOKENS = {canon: [normalize_text(a).split() for a in aliases]
                 for canon, aliases in COLUMN_ALIASES.items()}
 
+# =========================
+# Auxiliares de extração e reconstrução
+# =========================
 def extract_words(page, xt, yt):
     return page.extract_words(
         x_tolerance=xt,
@@ -106,7 +110,7 @@ def line_hits_for_canonical(line_text_norm: str):
     words = line_text_norm.split()
     hits_by = {canon: 0 for canon in CANONICAL_TITLES}
 
-    # função para buscar sequência de tokens
+    # busca de sequência exata
     def has_seq(seq):
         n = len(seq)
         for i in range(len(words) - n + 1):
@@ -214,6 +218,44 @@ def assign_words_to_columns(words, columns):
     return {name: " ".join(tokens).strip() for name, tokens in by_col.items()}
 
 # =========================
+# Regra para 4 primeiros numéricos
+# =========================
+NUM_RE = re.compile(r'^[+-]?\d+(?:[.,]\d+)?$')
+
+def fill_first_four_numeric(row: dict, line_words: list) -> dict:
+    """
+    Força os quatro primeiros valores numéricos da linha a preencher:
+    CBS, PCS, Quantidade para PCS, Item (nessa ordem).
+    Só aplica se uma dessas colunas estiver vazia ou não numérica.
+    Mantém tudo como texto.
+    """
+    first_four_cols = ["CBS", "PCS", "Quantidade para PCS", "Item"]
+
+    # Precisa aplicar? (algum dos quatro está vazio ou não numérico)
+    need_fix = False
+    for c in first_four_cols:
+        val = str(row.get(c, "")).strip()
+        if not val or not NUM_RE.match(val):
+            need_fix = True
+            break
+
+    if not need_fix:
+        return row
+
+    # Coletar tokens numéricos da linha (ordenados por x0)
+    ordered = sorted(line_words, key=lambda w: w["x0"])
+    nums = [w["text"].strip() for w in ordered if NUM_RE.match(w["text"].strip())]
+
+    # Se encontramos ao menos 4 números, aplicar mapeamento estrito
+    if len(nums) >= 4:
+        row["CBS"] = nums[0]
+        row["PCS"] = nums[1]
+        row["Quantidade para PCS"] = nums[2]
+        row["Item"] = nums[3]
+
+    return row
+
+# =========================
 # Execução
 # =========================
 if not dw_file:
@@ -266,11 +308,19 @@ with pdfplumber.open(dw_file) as pdf:
         # 4) montar linhas
         for ln in window_lines:
             row = assign_words_to_columns(ln["words"], columns)
-            if not any(v for v in row.values()):
-                continue
+
             # garantir todas as colunas canônicas presentes (mesmo vazias)
             for c in CANONICAL_TITLES:
                 row.setdefault(c, "")
+
+            # >>> Patch para garantir CBS/PCS/Quantidade para PCS/Item
+            if forcar_quatro_numeros:
+                row = fill_first_four_numeric(row, ln["words"])
+
+            # ignorar linha totalmente vazia (em colunas canônicas)
+            if not any(str(row.get(c, "")).strip() for c in CANONICAL_TITLES):
+                continue
+
             row["_page"] = pi + 1
             row["_y"] = ln["top"]
             all_rows.append(row)
@@ -335,4 +385,3 @@ if mostrar_pre and header_debug:
         st.code(hd["header_text"])
         for k, v in sorted(hd["title_x_map"].items(), key=lambda kv: kv[1]):
             st.write(f"- {k}: x≈{v:.1f}")
-
