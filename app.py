@@ -198,24 +198,29 @@ def build_column_boundaries(title_x_map, page_width):
         cols.append((name, x_left, x_right))
     return cols
 
-def assign_words_to_columns(words, columns):
+# =========================
+# Atribuição aos limites (com tokens detalhados)
+# =========================
+def assign_words_to_columns_detalhado(words, columns):
     """
-    Atribui tokens à coluna cujo x_center está dentro dos limites.
-    Mantém tudo como texto (sem conversões).
+    Retorna:
+      - row_text: {col: texto concatenado}
+      - row_tokens: {col: [tokens_pdfplumber]}
     """
-    by_col = {name: [] for name, _, _ in columns}
-    for w in words:
+    by_col_tokens = {name: [] for name, _, _ in columns}
+    # ordenar por x0 para preservar ordem na descrição
+    for w in sorted(words, key=lambda w: w["x0"]):
         x_center = (w["x0"] + w["x1"]) / 2.0
         for name, xl, xr in columns:
             if xl <= x_center <= xr:
-                by_col[name].append(w["text"])
+                by_col_tokens[name].append(w)
                 break
-    return {name: " ".join(tokens).strip() for name, tokens in by_col.items()}
+    row_text = {name: " ".join(t["text"] for t in toks).strip() for name, toks in by_col_tokens.items()}
+    return row_text, by_col_tokens
 
 # =========================
 # Regras de pós-processamento
 # =========================
-# Aceitar inteiros/decimais com ponto/vírgula e traços -, –, —
 NUM_RE   = re.compile(r'^[+-]?\d+(?:[.,]\d+)?$')
 PRIMITIVE_RE = re.compile(r'^(?:[+-]?\d+(?:[.,]\d+)?|[-–—])$')
 
@@ -226,16 +231,17 @@ def is_primitive_val(val: str) -> bool:
     v = normalize_dash(str(val).strip())
     return bool(PRIMITIVE_RE.match(v))
 
-def fill_first_four_primitives(row: dict, line_words: list) -> dict:
+def fill_first_four_primitives(row_text: dict, line_words: list) -> dict:
     """
     Força os quatro primeiros 'primitivos' (número ou traço) da linha a preencher:
     CBS, PCS, Quantidade para PCS, Item.
+    Atua sobre row_text (join de colunas), mantendo tudo como texto.
     """
     first_four_cols = ["CBS", "PCS", "Quantidade para PCS", "Item"]
 
     need_fix = False
     for c in first_four_cols:
-        val = str(row.get(c, "")).strip()
+        val = str(row_text.get(c, "")).strip()
         if not val or not is_primitive_val(val):
             need_fix = True
             break
@@ -251,55 +257,38 @@ def fill_first_four_primitives(row: dict, line_words: list) -> dict:
                 break
 
         if len(prims) >= 4:
-            row["CBS"] = prims[0]
-            row["PCS"] = prims[1]
-            row["Quantidade para PCS"] = prims[2]
-            row["Item"] = prims[3]
+            row_text["CBS"] = prims[0]
+            row_text["PCS"] = prims[1]
+            row_text["Quantidade para PCS"] = prims[2]
+            row_text["Item"] = prims[3]
 
-    return row
+    return row_text
 
-def fix_revision_and_description(row: dict) -> dict:
+def fix_revision_only_first_number(row_text: dict, row_tokens: dict) -> dict:
     """
-    'Revisão' deve conter **apenas o primeiro número puro** da célula.
-    Todo o restante é **concatenado em 'Descrição'**.
-    - Se não houver número puro na célula de 'Revisão':
-        * Se for apenas '-', mantém '-'
-        * Caso contrário, move tudo para 'Descrição' e zera 'Revisão'
+    Ajusta 'Revisão' para conter apenas o primeiro número puro encontrado nos tokens
+    da própria coluna 'Revisão'. Não move sobra para 'Descrição'.
     """
-    rev_raw = str(row.get("Revisão", "")).strip()
-    if not rev_raw:
-        return row
+    toks = row_tokens.get("Revisão", [])
+    if not toks:
+        return row_text
 
-    tokens = rev_raw.split()
-    idx_num = None
-    for i, t in enumerate(tokens):
-        if NUM_RE.match(t):  # número puro (não considera 'POS.3', por ex.)
-            idx_num = i
+    # procurar primeiro token numérico entre os tokens da coluna Revisão
+    rev_num = None
+    for t in toks:
+        s = t["text"].strip()
+        if NUM_RE.match(s):
+            rev_num = s
             break
 
-    if idx_num is None:
-        # Sem número puro; se for apenas traço, mantém
-        if rev_raw in ["-", "–", "—"]:
-            row["Revisão"] = "-"
-            return row
-        # Move tudo para Descrição
-        remainder = rev_raw
-        desc = str(row.get("Descrição", "")).strip()
-        row["Descrição"] = (desc + " " + remainder).strip() if desc else remainder
-        row["Revisão"] = ""
-        return row
-
-    # Primeiro número puro encontrado
-    rev_val = tokens[idx_num]
-    remainder_tokens = tokens[:idx_num] + tokens[idx_num+1:]
-    remainder = " ".join(remainder_tokens).strip()
-
-    row["Revisão"] = rev_val
-    if remainder:
-        desc = str(row.get("Descrição", "")).strip()
-        row["Descrição"] = (desc + " " + remainder).strip() if desc else remainder
-
-    return row
+    if rev_num is not None:
+        row_text["Revisão"] = rev_num
+    else:
+        # Se for apenas traço (ou vazio), mantém como está; senão, zera
+        raw = row_text.get("Revisão", "").strip()
+        if raw not in ["", "-", "–", "—"]:
+            row_text["Revisão"] = raw  # mantém o texto, caso deseje inspecionar
+    return row_text
 
 # =========================
 # Execução
@@ -353,26 +342,27 @@ with pdfplumber.open(dw_file) as pdf:
 
         # 4) montar linhas
         for ln in window_lines:
-            row = assign_words_to_columns(ln["words"], columns)
+            row_text, row_tokens = assign_words_to_columns_detalhado(ln["words"], columns)
 
             # garantir todas as colunas canônicas presentes (mesmo vazias)
             for c in CANONICAL_TITLES:
-                row.setdefault(c, "")
+                row_text.setdefault(c, "")
+                row_tokens.setdefault(c, [])
 
-            # Patch: 4 primeiros primitivos (número/traço)
+            # Patch: 4 primeiros primitivos (número/traço) para CBS/PCS/Qtd p/ PCS/Item
             if forcar_quatro_campos:
-                row = fill_first_four_primitives(row, ln["words"])
+                row_text = fill_first_four_primitives(row_text, ln["words"])
 
-            # Patch: Revisão = apenas 1º número; resto vai para Descrição
-            row = fix_revision_and_description(row)
+            # Patch: Revisão = apenas 1º número da própria coluna (sem mover para Descrição)
+            row_text = fix_revision_only_first_number(row_text, row_tokens)
 
             # ignorar linha totalmente vazia (em colunas canônicas)
-            if not any(str(row.get(c, "")).strip() for c in CANONICAL_TITLES):
+            if not any(str(row_text.get(c, "")).strip() for c in CANONICAL_TITLES):
                 continue
 
-            row["_page"] = pi + 1
-            row["_y"] = ln["top"]
-            all_rows.append(row)
+            row_text["_page"] = pi + 1
+            row_text["_y"] = ln["top"]
+            all_rows.append(row_text)
 
         header_debug.append({
             "page": pi + 1,
