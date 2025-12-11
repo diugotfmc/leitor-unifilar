@@ -28,7 +28,6 @@ with st.expander("⚙️ Opções avançadas"):
     header_required = st.number_input("Mínimo de títulos do cabeçalho a encontrar (>=)", 3, 10, 6)
     mostrar_pre = st.checkbox("Mostrar linhas reconstruídas / debug", value=False)
     mostrar_colunas = st.checkbox("Mostrar limites de colunas (x_left/x_right) – debug", value=False)
-    # Agora força números ou traços nas 4 primeiras colunas
     forcar_quatro_campos = st.checkbox("Forçar 4 primeiros campos (número ou traço) em CBS/PCS/Qtd p/ PCS/Item", value=True)
 
 # =========================
@@ -47,7 +46,6 @@ CANONICAL_TITLES = [
     "Descrição",
 ]
 
-# Aceitar variações do desenho e normalizar para os nomes acima
 COLUMN_ALIASES = {
     "CBS": ["cbs"],
     "PCS": ["pcs"],
@@ -69,7 +67,6 @@ def normalize_text(s: str) -> str:
     s = re.sub(r'\s+', ' ', s)
     return s.strip()
 
-# Converter aliases para tokens
 ALIAS_TOKENS = {canon: [normalize_text(a).split() for a in aliases]
                 for canon, aliases in COLUMN_ALIASES.items()}
 
@@ -111,7 +108,6 @@ def line_hits_for_canonical(line_text_norm: str):
     words = line_text_norm.split()
     hits_by = {canon: 0 for canon in CANONICAL_TITLES}
 
-    # busca de sequência exata
     def has_seq(seq):
         n = len(seq)
         for i in range(len(words) - n + 1):
@@ -163,12 +159,10 @@ def locate_title_x_positions(header_line):
 
     for canon, alias_tokens_list in ALIAS_TOKENS.items():
         x_found = None
-        # tenta cada variação até encontrar a primeira que casa
         for tokens in alias_tokens_list:
             x_found = find_seq(tokens)
             if x_found is not None:
                 break
-        # fallback: se não encontrar, tenta o primeiro token da primeira variação
         if x_found is None and alias_tokens_list:
             first_tok = alias_tokens_list[0][0]
             for i, t in enumerate(texts):
@@ -219,17 +213,14 @@ def assign_words_to_columns(words, columns):
     return {name: " ".join(tokens).strip() for name, tokens in by_col.items()}
 
 # =========================
-# Regra para 4 primeiros "primitivos" (número ou traço)
+# Regras de pós-processamento
 # =========================
-# Aceitar inteiros/decimais com ponto/vírgula (ex.: 104.1, 1,0000, 200) e traços -, –, —
+# Aceitar inteiros/decimais com ponto/vírgula e traços -, –, —
 NUM_RE   = re.compile(r'^[+-]?\d+(?:[.,]\d+)?$')
-DASH_RE  = re.compile(r'^[-–—]$')
 PRIMITIVE_RE = re.compile(r'^(?:[+-]?\d+(?:[.,]\d+)?|[-–—])$')
 
 def normalize_dash(s: str) -> str:
-    # unifica traços tipográficos para '-'
-    s = s.replace('–', '-').replace('—', '-')
-    return s
+    return s.replace('–', '-').replace('—', '-')
 
 def is_primitive_val(val: str) -> bool:
     v = normalize_dash(str(val).strip())
@@ -237,14 +228,11 @@ def is_primitive_val(val: str) -> bool:
 
 def fill_first_four_primitives(row: dict, line_words: list) -> dict:
     """
-    Força os quatro primeiros 'primitivos' da linha (número ou traço) a preencher:
-    CBS, PCS, Quantidade para PCS, Item (nessa ordem).
-    Mantém tudo como texto.
-    Ex.: '- - - 33' -> CBS='-', PCS='-', Quantidade para PCS='-', Item='33'
+    Força os quatro primeiros 'primitivos' (número ou traço) da linha a preencher:
+    CBS, PCS, Quantidade para PCS, Item.
     """
     first_four_cols = ["CBS", "PCS", "Quantidade para PCS", "Item"]
 
-    # Aplicar se algum dos quatro estiver vazio ou não for 'primitivo'
     need_fix = False
     for c in first_four_cols:
         val = str(row.get(c, "")).strip()
@@ -252,7 +240,6 @@ def fill_first_four_primitives(row: dict, line_words: list) -> dict:
             need_fix = True
             break
 
-    # Coletar tokens (esquerda→direita) que sejam 'primitivos'
     if need_fix:
         ordered = sorted(line_words, key=lambda w: w["x0"])
         prims = []
@@ -260,16 +247,57 @@ def fill_first_four_primitives(row: dict, line_words: list) -> dict:
             t = normalize_dash(w["text"].strip())
             if PRIMITIVE_RE.match(t):
                 prims.append(t)
-            # pare cedo se já coletou 4
             if len(prims) >= 4:
                 break
 
-        # Se encontramos ao menos 4, preencher na ordem
         if len(prims) >= 4:
             row["CBS"] = prims[0]
             row["PCS"] = prims[1]
             row["Quantidade para PCS"] = prims[2]
             row["Item"] = prims[3]
+
+    return row
+
+def fix_revision_and_description(row: dict) -> dict:
+    """
+    'Revisão' deve conter **apenas o primeiro número puro** da célula.
+    Todo o restante é **concatenado em 'Descrição'**.
+    - Se não houver número puro na célula de 'Revisão':
+        * Se for apenas '-', mantém '-'
+        * Caso contrário, move tudo para 'Descrição' e zera 'Revisão'
+    """
+    rev_raw = str(row.get("Revisão", "")).strip()
+    if not rev_raw:
+        return row
+
+    tokens = rev_raw.split()
+    idx_num = None
+    for i, t in enumerate(tokens):
+        if NUM_RE.match(t):  # número puro (não considera 'POS.3', por ex.)
+            idx_num = i
+            break
+
+    if idx_num is None:
+        # Sem número puro; se for apenas traço, mantém
+        if rev_raw in ["-", "–", "—"]:
+            row["Revisão"] = "-"
+            return row
+        # Move tudo para Descrição
+        remainder = rev_raw
+        desc = str(row.get("Descrição", "")).strip()
+        row["Descrição"] = (desc + " " + remainder).strip() if desc else remainder
+        row["Revisão"] = ""
+        return row
+
+    # Primeiro número puro encontrado
+    rev_val = tokens[idx_num]
+    remainder_tokens = tokens[:idx_num] + tokens[idx_num+1:]
+    remainder = " ".join(remainder_tokens).strip()
+
+    row["Revisão"] = rev_val
+    if remainder:
+        desc = str(row.get("Descrição", "")).strip()
+        row["Descrição"] = (desc + " " + remainder).strip() if desc else remainder
 
     return row
 
@@ -331,9 +359,12 @@ with pdfplumber.open(dw_file) as pdf:
             for c in CANONICAL_TITLES:
                 row.setdefault(c, "")
 
-            # >>> Patch para garantir CBS/PCS/Quantidade para PCS/Item com números ou traços
+            # Patch: 4 primeiros primitivos (número/traço)
             if forcar_quatro_campos:
                 row = fill_first_four_primitives(row, ln["words"])
+
+            # Patch: Revisão = apenas 1º número; resto vai para Descrição
+            row = fix_revision_and_description(row)
 
             # ignorar linha totalmente vazia (em colunas canônicas)
             if not any(str(row.get(c, "")).strip() for c in CANONICAL_TITLES):
